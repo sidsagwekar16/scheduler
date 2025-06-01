@@ -5,10 +5,11 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.blocking import BlockingScheduler
 import firebase_admin
 from firebase_admin import credentials, firestore
+from shapely.geometry import Point, Polygon
 
-# ----------------------------------
+# -------------------------------
 # 🔐 Initialize Firebase
-# ----------------------------------
+# -------------------------------
 def init_firebase():
     cred_dict = json.loads(base64.b64decode(os.environ["FIREBASE_CREDENTIALS_BASE64"]).decode())
     cred = credentials.Certificate(cred_dict)
@@ -17,9 +18,9 @@ def init_firebase():
 init_firebase()
 db = firestore.client()
 
-# ----------------------------------
+# -------------------------------
 # 🔔 System Alert Creator
-# ----------------------------------
+# -------------------------------
 def create_system_alert(agency_id, title, message, severity="medium", category="generic", site_id=None):
     alert = {
         "agencyId": agency_id,
@@ -33,9 +34,43 @@ def create_system_alert(agency_id, title, message, severity="medium", category="
     }
     db.collection("systemAlerts").add(alert)
 
-# ----------------------------------
+# -------------------------------
+# 🕒 Clock-In Grace Period Violation
+# -------------------------------
+def check_grace_violations():
+    now = datetime.utcnow().date()
+    settings = db.collection("agencySettings").stream()
+
+    for s in settings:
+        agency_id = s.id
+        grace = s.to_dict().get("clockInGracePeriod", 5)
+        if grace == 0:
+            continue
+
+        attendance = db.collection("attendance").where("agencyId", "==", agency_id).stream()
+        for doc in attendance:
+            att = doc.to_dict()
+            clock_in = att.get("clockIn")
+            sched = att.get("scheduledStart")
+            if not clock_in or not sched:
+                continue
+
+            clock_in_time = datetime.fromisoformat(clock_in.replace("Z", "+00:00"))
+            sched_time = datetime.fromisoformat(sched.replace("Z", "+00:00"))
+            if clock_in_time.date() != now:
+                continue
+            if clock_in_time > sched_time + timedelta(minutes=grace):
+                create_system_alert(
+                    agency_id,
+                    "Late Clock-In",
+                    f"Employee {att['userId']} clocked in beyond {grace}-minute grace.",
+                    category="late_clockin",
+                    site_id=att.get("siteId")
+                )
+
+# -------------------------------
 # 🔁 Auto Clock-Out
-# ----------------------------------
+# -------------------------------
 def auto_clockout_expired_shifts():
     now = datetime.utcnow()
     settings = db.collection("agencySettings").stream()
@@ -70,9 +105,9 @@ def auto_clockout_expired_shifts():
                 category="auto_clockout"
             )
 
-# ----------------------------------
+# -------------------------------
 # 🔕 Inactivity Reminders
-# ----------------------------------
+# -------------------------------
 def send_activity_reminders():
     now = datetime.utcnow()
     settings = db.collection("agencySettings").stream()
@@ -101,9 +136,52 @@ def send_activity_reminders():
                     category="inactivity"
                 )
 
-# ----------------------------------
+# -------------------------------
+# 📍 Geofence Leave Detection
+# -------------------------------
+def detect_geofence_leaves():
+    now = datetime.utcnow()
+    employees = db.collection("employees").stream()
+
+    for emp in employees:
+        e = emp.to_dict()
+        agency_id = e.get("agencyId")
+        site_id = e.get("assignedsiteID")
+        loc = e.get("lastKnownLocation")
+        if not site_id or not loc or not loc.get("lat") or not loc.get("lng"):
+            continue
+
+        site_doc = db.collection("sites").document(site_id).get()
+        if not site_doc.exists:
+            continue
+        site = site_doc.to_dict()
+        coords = site.get("coordinates", [])
+        if len(coords) < 3:
+            continue
+
+        point = Point(loc["lng"], loc["lat"])
+        polygon = Polygon([(c["lng"], c["lat"]) for c in coords])
+        if polygon.contains(point):
+            continue
+
+        settings_doc = db.collection("agencySettings").document(agency_id).get()
+        settings = settings_doc.to_dict() if settings_doc.exists else {}
+        leave_time = settings.get("geofenceTriggerDelay", 10)
+        leave_dist = settings.get("geofenceTriggerDistance", 250)
+
+        last_seen = datetime.fromisoformat(loc["updatedAt"].replace("Z", "+00:00"))
+        if (now - last_seen).total_seconds() > leave_time * 60:
+            create_system_alert(
+                agency_id,
+                "Geofence Violation",
+                f"{e.get('name')} left site fence for over {leave_time} min.",
+                category="geofence_leave",
+                site_id=site_id
+            )
+
+# -------------------------------
 # 🧾 License Expiry Reminders
-# ----------------------------------
+# -------------------------------
 def send_license_reminders():
     now = datetime.utcnow()
     settings = db.collection("agencySettings").stream()
@@ -128,13 +206,15 @@ def send_license_reminders():
                     category="license"
                 )
 
-# ----------------------------------
+# -------------------------------
 # ⏱ APScheduler Setup
-# ----------------------------------
+# -------------------------------
 if __name__ == "__main__":
     scheduler = BlockingScheduler()
+    scheduler.add_job(check_grace_violations, "cron", hour=7)
     scheduler.add_job(auto_clockout_expired_shifts, "interval", minutes=15)
     scheduler.add_job(send_activity_reminders, "interval", minutes=15)
+    scheduler.add_job(detect_geofence_leaves, "interval", minutes=10)
     scheduler.add_job(send_license_reminders, "cron", hour=7)
     print("✅ SecureFront Scheduler started...")
     scheduler.start()
