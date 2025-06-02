@@ -59,38 +59,54 @@ def check_grace_violations():
             shift = shift_doc.to_dict()
             shift_id = shift_doc.id
 
+            # Skip if already clocked in
             attendance = db.collection("attendance") \
                 .where("shiftId", "==", shift_id) \
                 .where("agencyId", "==", agency_id) \
                 .limit(1).stream()
 
             if any(True for _ in attendance):
-                continue  # already clocked in
+                continue
 
-            # Prevent duplicate alerts
-            recent_alerts = db.collection("systemAlerts") \
+            # Check if an alert for this shift already exists
+            existing_alerts = db.collection("systemAlerts") \
                 .where("agencyId", "==", agency_id) \
                 .where("category", "==", "late_clockin") \
                 .where("siteId", "==", shift.get("siteId")) \
-                .where("timestamp", ">=", (now - timedelta(minutes=grace_minutes)).isoformat() + "Z") \
+                .where("timestamp", ">=", (now - timedelta(hours=1)).isoformat() + "Z") \
                 .stream()
 
-            for a in recent_alerts:
-                if shift_id in a.to_dict().get("message", ""):
+            duplicate_found = False
+            for alert in existing_alerts:
+                data = alert.to_dict()
+                if data.get("metadata", {}).get("shiftId") == shift_id:
+                    duplicate_found = True
                     break
-            else:
-                emp_id = shift.get("employeeId", "")
-                emp_doc = db.collection("employees").document(emp_id).get()
-                emp_name = emp_doc.to_dict().get("name") if emp_doc.exists else emp_id
+            if duplicate_found:
+                continue
 
-                create_system_alert(
-                    agency_id,
-                    "Clock-In Missed",
-                    f"Employee {emp_name} did not clock in for their shift starting at {shift['shiftStart'][11:16]}.",
-                    category="late_clockin",
-                    site_id=shift.get("siteId")
-                )
+            # Get employee name
+            emp_id = shift.get("employeeId", "")
+            emp_name = emp_id
+            emp_doc = db.collection("employees").document(emp_id).get()
+            if emp_doc.exists:
+                emp_name = emp_doc.to_dict().get("name", emp_id)
 
+            # Create alert (store shiftId in metadata only)
+            alert_data = {
+                "agencyId": agency_id,
+                "title": "Clock-In Missed",
+                "message": f"Employee {emp_name} did not clock in for their shift starting at {shift['shiftStart'][11:16]}.",
+                "severity": "medium",
+                "category": "late_clockin",
+                "siteId": shift.get("siteId"),
+                "timestamp": now.isoformat() + "Z",
+                "read": False,
+                "metadata": { "shiftId": shift_id }  # invisible to UI but used for de-duping
+            }
+
+            db.collection("systemAlerts").add(alert_data)
+            print(f"🚨 Alert created: {emp_name} missed clock-in at {shift['shiftStart'][11:16]}")
 
 
 # -------------------------------
