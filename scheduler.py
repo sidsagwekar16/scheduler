@@ -38,42 +38,53 @@ def create_system_alert(agency_id, title, message, severity="medium", category="
 # 🕒 Clock-In Grace Period Violation (NEW)
 # -------------------------------
 def check_grace_violations():
-    now = datetime.now(timezone.utc)
+    print("[⏱] Running check_grace_violations...")
+    now = datetime.utcnow()
+    today = now.date()
+
     settings = db.collection("agencySettings").stream()
 
     for s in settings:
         agency_id = s.id
-        grace = s.to_dict().get("clockInGracePeriod", 5)
-        if grace == 0:
-            continue
+        grace_minutes = s.to_dict().get("clockInGracePeriod", 5)
 
-        # Find all shifts that started + grace has passed
-        shifts = db.collection("shifts")\
-            .where("agencyId", "==", agency_id)\
-            .where("shiftStart", "<=", (now - timedelta(minutes=grace)).isoformat())\
-            .where("shiftDate", "==", now.date().isoformat())\
+        shifts = db.collection("shifts") \
+            .where("agencyId", "==", agency_id) \
+            .where("shiftStart", "<=", (now - timedelta(minutes=grace_minutes)).isoformat() + "Z") \
             .stream()
 
         for shift_doc in shifts:
             shift = shift_doc.to_dict()
-            shift_id = shift_doc.id
-
-            # Skip if attendance with clock-in already exists
-            attendance = db.collection("attendance")\
-                .where("shiftId", "==", shift_id)\
-                .where("clockIn", "!=", None)\
-                .limit(1).stream()
-
-            if any(True for _ in attendance):
+            if not shift.get("employeeId") or not shift.get("siteId"):
                 continue
 
-            create_system_alert(
-                agency_id,
-                "Clock-In Missed",
-                f"Employee {shift['employeeId']} did not clock in within the {grace}-minute grace period.",
-                category="clockin_grace_violation",
-                site_id=shift.get("siteId")
-            )
+            # Only check today's shifts
+            shift_time = datetime.fromisoformat(shift["shiftStart"].replace("Z", "+00:00"))
+            if shift_time.date() != today:
+                continue
+
+            # Check attendance record
+            attendance_docs = db.collection("attendance") \
+                .where("shiftId", "==", shift_doc.id) \
+                .where("agencyId", "==", agency_id) \
+                .stream()
+
+            found = False
+            for att_doc in attendance_docs:
+                att = att_doc.to_dict()
+                if att.get("clockIn"):
+                    found = True
+                    break
+
+            if not found:
+                create_system_alert(
+                    agency_id,
+                    "Clock-In Missed",
+                    f"Employee {shift['employeeId']} did not clock in for their shift starting at {shift_time.time()}.",
+                    category="missed_clockin",
+                    site_id=shift["siteId"]
+                )
+
 
 # -------------------------------
 # 🔁 Auto Clock-Out
