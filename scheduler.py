@@ -142,7 +142,7 @@ def auto_clockout_expired_shifts():
             create_system_alert(
                 att["agencyId"],
                 "Auto Clock-Out Executed",
-                f"Employee {att['userId']} auto clocked out at shift end.",
+                f"Employee {att['userId']} auto clocked out at shift end..",
                 category="auto_clockout"
             )
 
