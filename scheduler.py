@@ -40,50 +40,57 @@ def create_system_alert(agency_id, title, message, severity="medium", category="
 def check_grace_violations():
     print("[⏱] Running check_grace_violations...")
     now = datetime.utcnow()
-    today = now.date()
-
     settings = db.collection("agencySettings").stream()
 
     for s in settings:
         agency_id = s.id
         grace_minutes = s.to_dict().get("clockInGracePeriod", 5)
+        if grace_minutes == 0:
+            continue
+
+        threshold_time = now - timedelta(minutes=grace_minutes)
 
         shifts = db.collection("shifts") \
             .where("agencyId", "==", agency_id) \
-            .where("shiftStart", "<=", (now - timedelta(minutes=grace_minutes)).isoformat() + "Z") \
+            .where("shiftStart", "<=", threshold_time.isoformat() + "Z") \
             .stream()
 
         for shift_doc in shifts:
             shift = shift_doc.to_dict()
-            if not shift.get("employeeId") or not shift.get("siteId"):
-                continue
+            shift_id = shift_doc.id
 
-            # Only check today's shifts
-            shift_time = datetime.fromisoformat(shift["shiftStart"].replace("Z", "+00:00"))
-            if shift_time.date() != today:
-                continue
-
-            # Check attendance record
-            attendance_docs = db.collection("attendance") \
-                .where("shiftId", "==", shift_doc.id) \
+            attendance = db.collection("attendance") \
+                .where("shiftId", "==", shift_id) \
                 .where("agencyId", "==", agency_id) \
+                .limit(1).stream()
+
+            if any(True for _ in attendance):
+                continue  # already clocked in
+
+            # Prevent duplicate alerts
+            recent_alerts = db.collection("systemAlerts") \
+                .where("agencyId", "==", agency_id) \
+                .where("category", "==", "late_clockin") \
+                .where("siteId", "==", shift.get("siteId")) \
+                .where("timestamp", ">=", (now - timedelta(minutes=grace_minutes)).isoformat() + "Z") \
                 .stream()
 
-            found = False
-            for att_doc in attendance_docs:
-                att = att_doc.to_dict()
-                if att.get("clockIn"):
-                    found = True
+            for a in recent_alerts:
+                if shift_id in a.to_dict().get("message", ""):
                     break
+            else:
+                emp_id = shift.get("employeeId", "")
+                emp_doc = db.collection("employees").document(emp_id).get()
+                emp_name = emp_doc.to_dict().get("name") if emp_doc.exists else emp_id
 
-            if not found:
                 create_system_alert(
                     agency_id,
                     "Clock-In Missed",
-                    f"Employee {shift['employeeId']} did not clock in for their shift starting at {shift_time.time()}.",
-                    category="missed_clockin",
-                    site_id=shift["siteId"]
+                    f"Employee {emp_name} did not clock in for their shift starting at {shift['shiftStart'][11:16]}.",
+                    category="late_clockin",
+                    site_id=shift.get("siteId")
                 )
+
 
 
 # -------------------------------
