@@ -1,7 +1,7 @@
 import os
 import base64
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.blocking import BlockingScheduler
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -35,10 +35,10 @@ def create_system_alert(agency_id, title, message, severity="medium", category="
     db.collection("systemAlerts").add(alert)
 
 # -------------------------------
-# 🕒 Clock-In Grace Period Violation
+# 🕒 Clock-In Grace Period Violation (NEW)
 # -------------------------------
 def check_grace_violations():
-    now = datetime.utcnow().date()
+    now = datetime.now(timezone.utc)
     settings = db.collection("agencySettings").stream()
 
     for s in settings:
@@ -47,26 +47,33 @@ def check_grace_violations():
         if grace == 0:
             continue
 
-        attendance = db.collection("attendance").where("agencyId", "==", agency_id).stream()
-        for doc in attendance:
-            att = doc.to_dict()
-            clock_in = att.get("clockIn")
-            sched = att.get("scheduledStart")
-            if not clock_in or not sched:
+        # Find all shifts that started + grace has passed
+        shifts = db.collection("shifts")\
+            .where("agencyId", "==", agency_id)\
+            .where("shiftStart", "<=", (now - timedelta(minutes=grace)).isoformat())\
+            .where("shiftDate", "==", now.date().isoformat())\
+            .stream()
+
+        for shift_doc in shifts:
+            shift = shift_doc.to_dict()
+            shift_id = shift_doc.id
+
+            # Skip if attendance with clock-in already exists
+            attendance = db.collection("attendance")\
+                .where("shiftId", "==", shift_id)\
+                .where("clockIn", "!=", None)\
+                .limit(1).stream()
+
+            if any(True for _ in attendance):
                 continue
 
-            clock_in_time = datetime.fromisoformat(clock_in.replace("Z", "+00:00"))
-            sched_time = datetime.fromisoformat(sched.replace("Z", "+00:00"))
-            if clock_in_time.date() != now:
-                continue
-            if clock_in_time > sched_time + timedelta(minutes=grace):
-                create_system_alert(
-                    agency_id,
-                    "Late Clock-In",
-                    f"Employee {att['userId']} clocked in beyond {grace}-minute grace.",
-                    category="late_clockin",
-                    site_id=att.get("siteId")
-                )
+            create_system_alert(
+                agency_id,
+                "Clock-In Missed",
+                f"Employee {shift['employeeId']} did not clock in within the {grace}-minute grace period.",
+                category="clockin_grace_violation",
+                site_id=shift.get("siteId")
+            )
 
 # -------------------------------
 # 🔁 Auto Clock-Out
@@ -167,7 +174,6 @@ def detect_geofence_leaves():
         settings_doc = db.collection("agencySettings").document(agency_id).get()
         settings = settings_doc.to_dict() if settings_doc.exists else {}
         leave_time = settings.get("geofenceTriggerDelay", 10)
-        leave_dist = settings.get("geofenceTriggerDistance", 250)
 
         last_seen = datetime.fromisoformat(loc["updatedAt"].replace("Z", "+00:00"))
         if (now - last_seen).total_seconds() > leave_time * 60:
@@ -211,7 +217,7 @@ def send_license_reminders():
 # -------------------------------
 if __name__ == "__main__":
     scheduler = BlockingScheduler()
-    scheduler.add_job(check_grace_violations, "cron", hour=7)
+    scheduler.add_job(check_grace_violations, "interval", minutes=1)
     scheduler.add_job(auto_clockout_expired_shifts, "interval", minutes=15)
     scheduler.add_job(send_activity_reminders, "interval", minutes=15)
     scheduler.add_job(detect_geofence_leaves, "interval", minutes=10)
